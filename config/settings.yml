@@ -1,0 +1,24 @@
+plugins:
+  user_search_enabled:
+    default: true
+    client: true
+
+  user_search_min_trust_level:
+    default: 1
+    client: false
+
+  user_search_gender_field_name:
+    default: "Gender"
+    client: false
+
+  user_search_country_field_name:
+    default: "Country"
+    client: false
+
+  user_search_listen_field_name:
+    default: "I prefer to listen to"
+    client: false
+
+  user_search_share_field_name:
+    default: "I prefer to share with"
+    client: false
