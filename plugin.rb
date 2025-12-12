@@ -1,4 +1,4 @@
-# name: discourse-user-search
+# name: Discourse-User-Search-v2
 # about: Advanced user search based on user custom fields
 # version: 2.0
 # authors: Chris
