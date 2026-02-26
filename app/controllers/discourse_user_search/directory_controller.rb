@@ -42,6 +42,9 @@ module DiscourseUserSearch
 
       users = apply_order(users, order, asc)
 
+      # Defensive: prevent duplicates caused by custom-field joins / data anomalies
+      users = users.distinct
+
       users = users
         .limit(per_page)
         .offset((page - 1) * per_page)
@@ -105,10 +108,21 @@ module DiscourseUserSearch
 
       custom_name = "user_field_#{field_id}"
 
-      alias_name = "ucf_#{field_id}_single"
-
-      scope.joins("JOIN user_custom_fields #{alias_name} ON #{alias_name}.user_id = users.id")
-           .where("#{alias_name}.name = ? AND #{alias_name}.value = ?", custom_name, value)
+      # Use EXISTS instead of JOIN to avoid duplicate rows when multiple custom-field
+      # rows exist for a user (can happen with historical data / imports).
+      scope.where(
+        <<~SQL,
+          EXISTS (
+            SELECT 1
+              FROM user_custom_fields ucf
+             WHERE ucf.user_id = users.id
+               AND ucf.name = ?
+               AND ucf.value = ?
+          )
+        SQL
+        custom_name,
+        value
+      )
     end
 
     def filter_by_custom_field_multi(scope, field_name, values)
@@ -117,10 +131,19 @@ module DiscourseUserSearch
 
       custom_name = "user_field_#{field_id}"
 
-      alias_name = "ucf_#{field_id}_multi"
-
-      scope.joins("JOIN user_custom_fields #{alias_name} ON #{alias_name}.user_id = users.id")
-           .where("#{alias_name}.name = ? AND #{alias_name}.value IN (?)", custom_name, values)
+      scope.where(
+        <<~SQL,
+          EXISTS (
+            SELECT 1
+              FROM user_custom_fields ucf
+             WHERE ucf.user_id = users.id
+               AND ucf.name = ?
+               AND ucf.value IN (?)
+          )
+        SQL
+        custom_name,
+        values
+      )
     end
   end
 end
