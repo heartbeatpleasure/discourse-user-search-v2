@@ -61,9 +61,6 @@ after_initialize do
       def apply(scope, params)
         return scope unless SiteSetting.user_search_enabled?
 
-        # Only apply on the Users Directory route (/u) where these params are used.
-        return scope unless HB_KEYS.any? { |k| params[k].present? }
-
         # Constrain to active, non-staged, non-suspended users with a minimum TL.
         min_tl = SiteSetting.user_search_min_trust_level.to_i
         now = Time.zone.now
@@ -100,6 +97,9 @@ after_initialize do
         field_id = user_field_id_by_name(field_name)
         return scope if field_id.nil? || value.blank?
 
+        value = value.to_s.strip.downcase
+        return scope if value.blank?
+
         custom_name = "user_field_#{field_id}"
 
         # Use EXISTS to avoid duplicates when historical data has multiple rows.
@@ -110,7 +110,7 @@ after_initialize do
                 FROM user_custom_fields ucf
                WHERE ucf.user_id = users.id
                  AND ucf.name = ?
-                 AND ucf.value = ?
+                 AND LOWER(TRIM(ucf.value)) = LOWER(TRIM(?))
             )
           SQL
           custom_name,
@@ -122,6 +122,9 @@ after_initialize do
         field_id = user_field_id_by_name(field_name)
         return scope if field_id.nil? || values.blank?
 
+        values = Array(values).map { |v| v.to_s.strip.downcase }.reject(&:blank?)
+        return scope if values.blank?
+
         custom_name = "user_field_#{field_id}"
 
         scope.where(
@@ -131,7 +134,7 @@ after_initialize do
                 FROM user_custom_fields ucf
                WHERE ucf.user_id = users.id
                  AND ucf.name = ?
-                 AND ucf.value IN (?)
+                 AND LOWER(TRIM(ucf.value)) IN (?)
             )
           SQL
           custom_name,
