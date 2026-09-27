@@ -1,12 +1,14 @@
 # name: discourse-user-search-v2
 # about: Advanced user search based on user custom fields
-# version: 2.0
+# version: 2.1.0
 # authors: Chris
 # url: https://github.com/heartbeatpleasure/discourse-user-search-v2
 
 enabled_site_setting :user_search_enabled
 
 after_initialize do
+  require_dependency "directory_items_controller"
+
   module ::DiscourseUserSearch
     PLUGIN_NAME = "discourse-user-search".freeze
 
@@ -14,105 +16,122 @@ after_initialize do
       engine_name PLUGIN_NAME
       isolate_namespace DiscourseUserSearch
     end
-  end
 
-  # loading controllers
-  require_dependency File.expand_path(
-    "../app/controllers/discourse_user_search/directory_controller.rb",
-    __FILE__
-  )
+    # Request-local bridge between DirectoryItemsController and DirectoryItemsQuery.
+    # Keeping this request-scoped avoids thread leakage and lets core keep ownership
+    # of the directory query itself.
+    class DirectoryRequestContext < ActiveSupport::CurrentAttributes
+      attribute :params
+    end
 
-  require_dependency File.expand_path(
-    "../app/controllers/discourse_user_search/options_controller.rb",
-    __FILE__
-  )
+    class << self
+      attr_writer :directory_integration_available
 
-  # routes inside the engine
-  DiscourseUserSearch::Engine.routes.draw do
-    # searching users (already have this)
-    get "/user-search" => "directory#index"
+      def directory_integration_available?
+        @directory_integration_available == true
+      end
+    end
 
-    # endpoint for dropdown options
-    get "/user-search/options" => "options#index"
-  end
-
-  # mounting engine at root
-  Discourse::Application.routes.append do
-    mount ::DiscourseUserSearch::Engine, at: "/"
-  end
-
-  # ------------------------------------------------------------
-  # Server-side filtering and sorting for /u (User Directory)
-  #
-  # The User Card Directory plugin builds the cards from the
-  # /directory_items.json endpoint. We apply filters server-side to
-  # avoid duplicates/missing users and to make pagination stable.
-  # ------------------------------------------------------------
-
-  require_dependency "directory_items_controller"
-
-  module ::DiscourseUserSearch
     module DirectoryFilters
       HB_KEYS = %i[hb_gender hb_country hb_listen hb_share].freeze
+      CUSTOM_SORTS = %w[last_seen joined].freeze
+      UI_SORTS = %w[last_seen username joined].freeze
+      MAX_FILTER_VALUE_LENGTH = 255
+      MAX_MULTI_VALUES = 20
       module_function
 
-      def filters_present?(params)
-        HB_KEYS.any? { |k| params[k].present? }
+      def extract_directory_params(params)
+        values = extract_filter_params(params)
+        order = value_for(params, :order).to_s.strip
+        values[:order] = order if order.present?
+        values.freeze
       end
 
-      def apply(scope, params)
+      def extract_filter_params(params)
+        HB_KEYS.each_with_object({}) do |key, out|
+          value = sanitize_filter_value(value_for(params, key))
+          out[key] = value if value.present?
+        end
+      end
+
+      def filters_present?(params)
+        HB_KEYS.any? { |key| sanitize_filter_value(value_for(params, key)).present? }
+      end
+
+      def custom_sort?(order)
+        CUSTOM_SORTS.include?(order.to_s)
+      end
+
+      def ui_sort?(order)
+        UI_SORTS.include?(order.to_s)
+      end
+
+      def apply_to_users(scope, params)
         return scope unless SiteSetting.user_search_enabled?
 
-        # Always constrain directory results to:
-        # - active, non-staged users
-        # - trust level >= configured minimum
-        # - not currently suspended
-        min_tl = SiteSetting.user_search_min_trust_level.to_i
-        now = Time.zone.now
+        scope = apply_eligibility(scope)
+        apply_custom_field_filters(scope, params)
+      end
 
-        scope =
-          scope
-            .joins(:user)
-            .where(users: { active: true, staged: false })
-            .where("users.trust_level >= ?", min_tl)
-            .where("users.suspended_till IS NULL OR users.suspended_till < ?", now)
+      def apply_to_directory_items(scope, params, allow_custom_filters:)
+        return scope unless SiteSetting.user_search_enabled?
 
-        # Only apply custom-field filters when hb_* params are present.
-        return scope unless filters_present?(params)
+        # DirectoryItem does not join users by default. Add the association once
+        # so eligibility and custom-field EXISTS clauses can safely reference users.id.
+        scope = scope.joins(:user)
+        scope = apply_eligibility(scope)
+        return scope unless allow_custom_filters
 
-        scope = filter_by_custom_field(scope, SiteSetting.user_search_gender_field_name, params[:hb_gender])
-        scope = filter_by_custom_field(scope, SiteSetting.user_search_country_field_name, params[:hb_country])
+        apply_custom_field_filters(scope, params)
+      end
 
-        scope = filter_by_custom_field_multi(scope, SiteSetting.user_search_listen_field_name, csv(params[:hb_listen]))
-        scope = filter_by_custom_field_multi(scope, SiteSetting.user_search_share_field_name, csv(params[:hb_share]))
+      def user_eligible?(user)
+        return false if user.blank?
+        return false unless user.active?
+        return false if user.staged?
+        return false if user.trust_level.to_i < minimum_trust_level
 
-        scope
+        suspended_till = user.suspended_till
+        suspended_till.blank? || suspended_till < Time.zone.now
       end
 
       def csv(str)
         return [] if str.blank?
-        str.to_s.split(",").map(&:strip).reject(&:blank?)
+
+        str
+          .to_s
+          .split(",", MAX_MULTI_VALUES + 1)
+          .first(MAX_MULTI_VALUES)
+          .map { |value| sanitize_filter_value(value) }
+          .reject(&:blank?)
       end
 
       def user_field_id_by_name(field_name)
         return nil if field_name.blank?
-        @user_fields_by_name ||= ::UserField.all.index_by(&:name)
-        @user_fields_by_name[field_name]&.id
+
+        # Do not cache this across requests: admins may rename/reconfigure fields
+        # without restarting the application.
+        ::UserField.find_by(name: field_name)&.id
       end
 
-      def norm(val)
-        val.to_s.strip.downcase
+      def norm(value)
+        sanitize_filter_value(value).downcase
+      end
+
+      def sanitize_filter_value(value)
+        value.to_s.strip[0, MAX_FILTER_VALUE_LENGTH]
       end
 
       def filter_by_custom_field(scope, field_name, value)
         field_id = user_field_id_by_name(field_name)
         return scope if field_id.nil? || value.blank?
 
-        custom_name = "user_field_#{field_id}"
+        custom_name = "#{User::USER_FIELD_PREFIX}#{field_id}"
         value_norm = norm(value)
         return scope if value_norm.blank?
 
-        # Use EXISTS to avoid duplicates when historical data has multiple rows.
+        # EXISTS avoids duplicate directory rows if historical/imported data has
+        # more than one custom-field record for the same user and field.
         scope.where(
           <<~SQL,
             EXISTS (
@@ -124,7 +143,7 @@ after_initialize do
             )
           SQL
           custom_name,
-          value_norm
+          value_norm,
         )
       end
 
@@ -132,8 +151,8 @@ after_initialize do
         field_id = user_field_id_by_name(field_name)
         return scope if field_id.nil? || values.blank?
 
-        custom_name = "user_field_#{field_id}"
-        values_norm = Array(values).map { |v| norm(v) }.reject(&:blank?)
+        custom_name = "#{User::USER_FIELD_PREFIX}#{field_id}"
+        values_norm = Array(values).first(MAX_MULTI_VALUES).map { |value| norm(value) }.reject(&:blank?).uniq
         return scope if values_norm.blank?
 
         scope.where(
@@ -147,216 +166,197 @@ after_initialize do
             )
           SQL
           custom_name,
-          values_norm
+          values_norm,
         )
       end
+
+      def apply_eligibility(scope)
+        now = Time.zone.now
+
+        scope
+          .where(users: { active: true, staged: false })
+          .where("users.trust_level >= ?", minimum_trust_level)
+          .where("users.suspended_till IS NULL OR users.suspended_till < ?", now)
+      end
+      private_class_method :apply_eligibility
+
+      def apply_custom_field_filters(scope, params)
+        return scope unless filters_present?(params)
+
+        scope = filter_by_custom_field(
+          scope,
+          SiteSetting.user_search_gender_field_name,
+          value_for(params, :hb_gender),
+        )
+        scope = filter_by_custom_field(
+          scope,
+          SiteSetting.user_search_country_field_name,
+          value_for(params, :hb_country),
+        )
+        scope = filter_by_custom_field_multi(
+          scope,
+          SiteSetting.user_search_listen_field_name,
+          csv(value_for(params, :hb_listen)),
+        )
+        filter_by_custom_field_multi(
+          scope,
+          SiteSetting.user_search_share_field_name,
+          csv(value_for(params, :hb_share)),
+        )
+      end
+      private_class_method :apply_custom_field_filters
+
+      def minimum_trust_level
+        SiteSetting.user_search_min_trust_level.to_i.clamp(0, 4)
+      end
+      private_class_method :minimum_trust_level
+
+      def value_for(params, key)
+        return nil if params.blank?
+
+        params[key] || params[key.to_s]
+      end
+      private_class_method :value_for
     end
-  end
 
-  module ::DiscourseUserSearch
+    # Minimal controller integration only. Core continues to own index, query
+    # construction, permissions, serialization and pagination.
     module DirectoryItemsControllerPatch
-      # Apply our baseline constraints + hb_* filtering after core's exclude_groups handling.
-      def apply_exclude_groups_filter(result)
-        result = super
-        ::DiscourseUserSearch::DirectoryFilters.apply(result, params)
-      end
-
-      # Support custom sort orders and disable "pin current user" behavior when:
-      # - hb_* filters are active (pinning can bypass filters)
-      # - our custom ordering is used (pinning breaks sort expectations)
       def index
-        order = params[:order].presence
-        needs_custom_index =
-          order.blank? ||
-            ::DiscourseUserSearch::DirectoryFilters.filters_present?(params) ||
-            %w[last_seen joined username].include?(order)
-
-        return super unless needs_custom_index
-        index_with_hb_order
-      end
-
-      # Ensure pagination keeps hb_* params, so "Load more" stays filtered.
-      def render_json_dump(obj, *args)
-        if obj.is_a?(Hash) && obj[:meta].is_a?(Hash)
-          url = obj[:meta][:load_more_directory_items]
-          if url.present?
-            begin
-              uri = URI.parse(url)
-              qp = Rack::Utils.parse_query(uri.query)
-
-              ::DiscourseUserSearch::DirectoryFilters::HB_KEYS.each do |k|
-                v = params[k]
-                qp[k.to_s] = v if v.present?
-              end
-
-              uri.query = qp.to_query.presence
-              obj[:meta][:load_more_directory_items] = uri.to_s
-            rescue
-              # If URI parsing fails, don't break the response.
-            end
-          end
+        if SiteSetting.user_search_enabled? && current_user.present?
+          DirectoryRequestContext.params = DirectoryFilters.extract_directory_params(params)
         end
 
-        super(obj, *args)
+        super
+      ensure
+        DirectoryRequestContext.reset
+      end
+
+      # Core builds its load-more URL from a fixed allowlist. Preserve our hb_*
+      # parameters without replacing/copying core's pagination implementation.
+      def render_json_dump(obj, opts = nil)
+        append_hb_filters_to_load_more!(obj) if SiteSetting.user_search_enabled? && current_user.present?
+        super(obj, opts)
       end
 
       private
 
-      # Copy of core DirectoryItemsController#index with minimal changes:
-      # - default order is last_seen
-      # - support order=last_seen and order=joined
-      # - disable the "pin current user" insertion
-      def index_with_hb_order
-        unless SiteSetting.enable_user_directory?
-          raise Discourse::InvalidAccess.new(:enable_user_directory)
+      def append_hb_filters_to_load_more!(obj)
+        return unless obj.is_a?(Hash) && obj[:meta].is_a?(Hash)
+
+        url = obj[:meta][:load_more_directory_items]
+        return if url.blank?
+
+        filters = DirectoryFilters.extract_filter_params(params)
+        return if filters.blank?
+
+        uri = URI.parse(url)
+        query = Rack::Utils.parse_query(uri.query)
+        filters.each { |key, value| query[key.to_s] = value }
+        uri.query = query.to_query.presence
+        obj[:meta][:load_more_directory_items] = uri.to_s
+      rescue URI::InvalidURIError, ArgumentError
+        # Never break the directory response if a future core version changes
+        # the load-more URL format.
+        nil
+      end
+    end
+
+    # Extend only the two small query hooks needed by this plugin. Everything
+    # else remains Discourse core behavior and automatically inherits future
+    # permission/search/pagination fixes.
+    module DirectoryItemsQueryPatch
+      private
+
+      def order_items(items, requested_order, ascending, *args, **kwargs)
+        context = DirectoryRequestContext.params
+        if context.nil? || !SiteSetting.user_search_enabled?
+          return super(items, requested_order, ascending, *args, **kwargs)
         end
 
-        period = params.require(:period)
-        period_type = DirectoryItem.period_types[period.to_sym]
-        raise Discourse::InvalidAccess.new(:period_type) unless period_type
+        items =
+          DirectoryFilters.apply_to_directory_items(
+            items,
+            context,
+            allow_custom_filters: user.present?,
+          )
 
-        result = DirectoryItem.where(period_type: period_type).includes(user: :user_custom_fields)
+        # The custom activity/join-date sorts are available only to authenticated
+        # users. Anonymous callers fall back to core, preventing activity-order
+        # enumeration if a site's directory is publicly visible.
+        if user.present? && DirectoryFilters.custom_sort?(requested_order)
+          direction = ascending ? :asc : :desc
+          user_table = User.arel_table
+          directory_table = DirectoryItem.arel_table
 
-        if params[:group]
-          group = Group.find_by(name: params[:group])
-          raise Discourse::InvalidParameters.new(:group) if group.blank?
-
-          guardian.ensure_can_see!(group)
-          guardian.ensure_can_see_group_members!(group)
-
-          result = result.includes(user: :groups).where(users: { groups: { id: group.id } })
-        else
-          result = result.includes(user: :primary_group)
-        end
-
-        result = apply_exclude_groups_filter(result)
-
-        if params[:exclude_usernames]
-          result =
-            result
-              .references(:user)
-              .where.not(users: { username: params[:exclude_usernames].split(",") })
-        end
-
-        order = params[:order].presence || "last_seen"
-        dir = params[:asc] ? "ASC" : "DESC"
-        active_directory_column_names = DirectoryColumn.active_column_names
-
-        if order == "last_seen"
-          result =
-            result
-              .references(:user)
-              .order("users.last_seen_at #{dir} NULLS LAST, directory_items.id")
-        elsif order == "joined"
-          result =
-            result
-              .references(:user)
-              .order("users.created_at #{dir}, directory_items.id")
-        elsif order == "username"
-          result =
-            result
-              .references(:user)
-              .order("users.username #{dir}, directory_items.id")
-        elsif active_directory_column_names.include?(order.to_sym)
-          result = result.order("directory_items.#{order} #{dir}, directory_items.id")
-        else
-          # Ordering by user field value
-          user_field = UserField.find_by(name: params[:order])
-          if user_field
-            result =
-              result
-                .references(:user)
-                .joins(
-                  "LEFT OUTER JOIN user_custom_fields ON user_custom_fields.user_id = users.id AND user_custom_fields.name = 'user_field_#{user_field.id}'"
-                )
-                .order(
-                  "user_custom_fields.name = 'user_field_#{user_field.id}' ASC, user_custom_fields.value #{dir}"
-                )
-          end
-        end
-
-        result = result.includes(:user_stat) if period_type == DirectoryItem.period_types[:all]
-
-        page = fetch_int_from_params(:page, default: 0, max: ::DirectoryItemsController::PAGE_LIMIT)
-        user_ids = nil
-
-        if params[:name].present?
-          user_ids =
-            UserSearch.new(params[:name], { include_staged_users: true, limit: 200 })
-              .search
-              .pluck(:id)
-
-          if user_ids.present?
-            # core behavior: include yourself if there are matches
-            user_ids << current_user.id if current_user && result.dup.where(user_id: user_ids).exists?
-            result = result.where(user_id: user_ids)
-          else
-            result = result.where("false")
-          end
-        end
-
-        if params[:username]
-          user_id = User.where(username_lower: params[:username].to_s.downcase).pick(:id)
-          if user_id
-            result = result.where(user_id: user_id)
-          else
-            result = result.where("false")
-          end
-        end
-
-        limit = fetch_limit_from_params(default: ::DirectoryItemsController::PAGE_SIZE, max: ::DirectoryItemsController::PAGE_SIZE)
-        result_count = result.count
-        result = result.limit(limit).offset(limit * page).to_a
-
-        more_params =
-          params
-            .slice(:period, :order, :asc, :group, :user_field_ids, :plugin_column_ids, :name)
-            .permit!
-        more_params[:order] ||= order
-        more_params[:page] = page + 1
-
-        load_more_uri = URI.parse(directory_items_path(more_params))
-        load_more_directory_items_json = "#{load_more_uri.path}.json?#{load_more_uri.query}"
-
-        last_updated_at = DirectoryItem.last_updated_at(period_type)
-
-        serializer_opts = {}
-        if params[:user_field_ids]
-          serializer_opts[:user_custom_field_map] = {}
-          allowed_field_ids =
-            if guardian.is_staff?
-              UserField.pluck(:id)
+          primary_order =
+            if requested_order.to_s == "last_seen"
+              Arel.sql("users.last_seen_at #{ascending ? "ASC" : "DESC"} NULLS LAST")
             else
-              UserField.public_fields.pluck(:id)
+              user_table[:created_at].public_send(direction)
             end
 
-          user_field_ids = params[:user_field_ids].split("|").map(&:to_i) & allowed_field_ids
-          user_field_ids.each do |user_field_id|
-            serializer_opts[:user_custom_field_map]["#{User::USER_FIELD_PREFIX}#{user_field_id}"] =
-              user_field_id
-          end
+          return items.joins(:user).order(primary_order, directory_table[:id].asc)
         end
 
-        if params[:plugin_column_ids]
-          serializer_opts[:plugin_column_ids] = params[:plugin_column_ids]&.split("|")&.map(&:to_i)
-        end
+        # Username and every native/current/future Discourse sort stay entirely
+        # inside core, including its public-user-field security restrictions.
+        super(items, requested_order, ascending, *args, **kwargs)
+      end
 
-        serializer_opts[:attributes] = active_directory_column_names
-        serializer_opts[:searchable_fields] = UserField.where(searchable: true) if serializer_opts[:user_custom_field_map].present?
+      def prioritize_user!(items, *args, **kwargs)
+        context = DirectoryRequestContext.params
+        return super(items, *args, **kwargs) if context.nil? || !SiteSetting.user_search_enabled?
 
-        serialized = serialize_data(result, DirectoryItemSerializer, serializer_opts)
+        # Pinning the current user can bypass an hb_* filter and would also break
+        # the strict ordering shown by our three UI sort modes.
+        return if DirectoryFilters.filters_present?(context)
+        return if DirectoryFilters.ui_sort?(context[:order])
 
-        render_json_dump(
-          directory_items: serialized,
-          meta: {
-            last_updated_at: last_updated_at,
-            total_rows_directory_items: result_count,
-            load_more_directory_items: load_more_directory_items_json,
-          },
-        )
+        # Keep core pinning for native sorts only when the current user satisfies
+        # the same eligibility constraints as every other directory result.
+        return unless DirectoryFilters.user_eligible?(user)
+
+        super(items, *args, **kwargs)
       end
     end
   end
 
-  ::DirectoryItemsController.prepend(::DiscourseUserSearch::DirectoryItemsControllerPatch)
+  # Load controllers only after the shared filtering module exists.
+  require_dependency File.expand_path(
+    "app/controllers/discourse_user_search/directory_controller.rb",
+    __dir__,
+  )
+  require_dependency File.expand_path(
+    "app/controllers/discourse_user_search/options_controller.rb",
+    __dir__,
+  )
+
+  DiscourseUserSearch::Engine.routes.draw do
+    get "/user-search" => "directory#index"
+    get "/user-search/options" => "options#index"
+  end
+
+  Discourse::Application.routes.append do
+    mount ::DiscourseUserSearch::Engine, at: "/"
+  end
+
+  # Fail safe: if a future Discourse version changes the two small private query
+  # hooks we depend on, leave the core /u directory untouched instead of risking
+  # a 500. The options endpoint exposes this capability to the theme component.
+  directory_integration_available =
+    ::DirectoryItemsQuery.private_method_defined?(:order_items) &&
+      ::DirectoryItemsQuery.private_method_defined?(:prioritize_user!)
+
+  ::DiscourseUserSearch.directory_integration_available = directory_integration_available
+
+  if directory_integration_available
+    ::DirectoryItemsController.prepend(::DiscourseUserSearch::DirectoryItemsControllerPatch)
+    ::DirectoryItemsQuery.prepend(::DiscourseUserSearch::DirectoryItemsQueryPatch)
+  else
+    Rails.logger.warn(
+      "[discourse-user-search-v2] DirectoryItemsQuery integration unavailable; " \
+        "advanced /u filtering disabled while the core user directory remains unchanged.",
+    )
+  end
 end
