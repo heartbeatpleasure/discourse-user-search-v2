@@ -15,6 +15,9 @@ module DiscourseUserSearch
 
       page = params.fetch(:page, 1).to_i
       page = 1 if page <= 0
+      if page > ::DiscourseUserSearch::LEGACY_API_PAGE_LIMIT
+        raise Discourse::InvalidParameters.new(:page)
+      end
 
       per_page = params[:per_page].to_i
       per_page = 30 if per_page <= 0

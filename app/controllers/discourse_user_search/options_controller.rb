@@ -21,14 +21,7 @@ module DiscourseUserSearch
     private
 
     def options_for(field_name)
-      return [] if field_name.blank?
-
-      field = ::UserField.find_by(name: field_name)
-      return [] if field.nil?
-
-      # Do not sort on :position; that column is not guaranteed on every
-      # supported Discourse/user-field schema.
-      field.user_field_options.order(:id).pluck(:value)
+      ::DiscourseUserSearch::DirectoryFilters.option_values_for(field_name)
     end
   end
 end

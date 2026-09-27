@@ -1,6 +1,6 @@
 # name: discourse-user-search-v2
 # about: Advanced user search based on user custom fields
-# version: 2.1.0
+# version: 2.2.0
 # authors: Chris
 # url: https://github.com/heartbeatpleasure/discourse-user-search-v2
 
@@ -11,6 +11,8 @@ after_initialize do
 
   module ::DiscourseUserSearch
     PLUGIN_NAME = "discourse-user-search".freeze
+    DIRECTORY_PAGE_LIMIT = 100
+    LEGACY_API_PAGE_LIMIT = 100
 
     class Engine < ::Rails::Engine
       engine_name PLUGIN_NAME
@@ -30,6 +32,33 @@ after_initialize do
       def directory_integration_available?
         @directory_integration_available == true
       end
+
+      def directory_integration_compatible?
+        order_method = directory_query_method(:order_items)
+        prioritize_method = directory_query_method(:prioritize_user!)
+        return false if order_method.nil? || prioritize_method.nil?
+
+        order_method.parameters.first(3) == [
+          [:req, :items],
+          [:req, :requested_order],
+          [:req, :ascending],
+        ] && prioritize_method.parameters.first == [:req, :items]
+      rescue NameError
+        false
+      end
+
+      private
+
+      def directory_query_method(name)
+        return nil unless ::DirectoryItemsQuery.private_method_defined?(name)
+
+        method = ::DirectoryItemsQuery.instance_method(name)
+        if defined?(::DiscourseUserSearch::DirectoryItemsQueryPatch) &&
+             method.owner == ::DiscourseUserSearch::DirectoryItemsQueryPatch
+          method = method.super_method
+        end
+        method
+      end
     end
 
     module DirectoryFilters
@@ -38,6 +67,7 @@ after_initialize do
       UI_SORTS = %w[last_seen username joined].freeze
       MAX_FILTER_VALUE_LENGTH = 255
       MAX_MULTI_VALUES = 20
+      FILTER_FIELD_TYPES = %w[dropdown multiselect].freeze
       module_function
 
       def extract_directory_params(params)
@@ -106,12 +136,25 @@ after_initialize do
           .reject(&:blank?)
       end
 
-      def user_field_id_by_name(field_name)
+      def filterable_user_field(field_name)
         return nil if field_name.blank?
 
-        # Do not cache this across requests: admins may rename/reconfigure fields
-        # without restarting the application.
-        ::UserField.find_by(name: field_name)&.id
+        field = ::UserField.includes(:user_field_options).find_by(name: field_name)
+        return nil if field.nil?
+        return nil unless FILTER_FIELD_TYPES.include?(field.field_type.to_s)
+
+        # Searchable fields are already eligible for core directory search. Public
+        # profile/card fields are also safe to expose as explicit filter options.
+        return nil unless field.searchable? || field.show_on_profile? || field.show_on_user_card?
+
+        field
+      end
+
+      def option_values_for(field_name)
+        field = filterable_user_field(field_name)
+        return [] if field.nil?
+
+        field.user_field_options.sort_by(&:id).map(&:value)
       end
 
       def norm(value)
@@ -123,12 +166,15 @@ after_initialize do
       end
 
       def filter_by_custom_field(scope, field_name, value)
-        field_id = user_field_id_by_name(field_name)
-        return scope if field_id.nil? || value.blank?
+        return scope if value.blank?
 
-        custom_name = "#{User::USER_FIELD_PREFIX}#{field_id}"
-        value_norm = norm(value)
-        return scope if value_norm.blank?
+        field = filterable_user_field(field_name)
+        return scope.none if field.nil?
+
+        value_norm = validated_option_norm(field, value)
+        return scope.none if value_norm.nil?
+
+        custom_name = "#{User::USER_FIELD_PREFIX}#{field.id}"
 
         # EXISTS avoids duplicate directory rows if historical/imported data has
         # more than one custom-field record for the same user and field.
@@ -148,12 +194,19 @@ after_initialize do
       end
 
       def filter_by_custom_field_multi(scope, field_name, values)
-        field_id = user_field_id_by_name(field_name)
-        return scope if field_id.nil? || values.blank?
+        values = Array(values).first(MAX_MULTI_VALUES)
+        return scope if values.blank?
 
-        custom_name = "#{User::USER_FIELD_PREFIX}#{field_id}"
-        values_norm = Array(values).first(MAX_MULTI_VALUES).map { |value| norm(value) }.reject(&:blank?).uniq
+        field = filterable_user_field(field_name)
+        return scope.none if field.nil?
+
+        values_norm = values.map { |value| norm(value) }.reject(&:blank?).uniq
         return scope if values_norm.blank?
+
+        allowed_values = option_norms(field)
+        return scope.none unless values_norm.all? { |value| allowed_values.include?(value) }
+
+        custom_name = "#{User::USER_FIELD_PREFIX}#{field.id}"
 
         scope.where(
           <<~SQL,
@@ -169,6 +222,19 @@ after_initialize do
           values_norm,
         )
       end
+
+      def validated_option_norm(field, value)
+        value_norm = norm(value)
+        return nil if value_norm.blank?
+
+        option_norms(field).include?(value_norm) ? value_norm : nil
+      end
+      private_class_method :validated_option_norm
+
+      def option_norms(field)
+        field.user_field_options.map { |option| norm(option.value) }.reject(&:blank?).uniq
+      end
+      private_class_method :option_norms
 
       def apply_eligibility(scope)
         now = Time.zone.now
@@ -237,6 +303,18 @@ after_initialize do
       def render_json_dump(obj, opts = nil)
         append_hb_filters_to_load_more!(obj) if SiteSetting.user_search_enabled? && current_user.present?
         super(obj, opts)
+      end
+
+      # Core intentionally caps directory pagination. The card directory already
+      # loads in batches, so authenticated users can safely page through the full
+      # member set without increasing the per-request page size.
+      def fetch_int_from_params(key, *args, **kwargs)
+        if key.to_sym == :page && !DirectoryRequestContext.params.nil? && kwargs[:max].present?
+          kwargs = kwargs.dup
+          kwargs[:max] = [kwargs[:max].to_i, ::DiscourseUserSearch::DIRECTORY_PAGE_LIMIT].max
+        end
+
+        super(key, *args, **kwargs)
       end
 
       private
@@ -344,9 +422,7 @@ after_initialize do
   # Fail safe: if a future Discourse version changes the two small private query
   # hooks we depend on, leave the core /u directory untouched instead of risking
   # a 500. The options endpoint exposes this capability to the theme component.
-  directory_integration_available =
-    ::DirectoryItemsQuery.private_method_defined?(:order_items) &&
-      ::DirectoryItemsQuery.private_method_defined?(:prioritize_user!)
+  directory_integration_available = ::DiscourseUserSearch.directory_integration_compatible?
 
   ::DiscourseUserSearch.directory_integration_available = directory_integration_available
 
