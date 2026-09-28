@@ -1,6 +1,6 @@
 # name: discourse-user-search-v2
 # about: Advanced user search based on user custom fields
-# version: 2.2.0
+# version: 2.2.1
 # authors: Chris
 # url: https://github.com/heartbeatpleasure/discourse-user-search-v2
 
@@ -116,13 +116,11 @@ after_initialize do
       end
 
       def user_eligible?(user)
-        return false if user.blank?
-        return false unless user.active?
-        return false if user.staged?
-        return false if user.trust_level.to_i < minimum_trust_level
+        return false if user.blank? || user.id.blank?
 
-        suspended_till = user.suspended_till
-        suspended_till.blank? || suspended_till < Time.zone.now
+        # Keep the single-user check exactly aligned with the relation used by
+        # both /u and the legacy API so visibility rules cannot drift apart.
+        apply_eligibility(::User.where(id: user.id)).exists?
       end
 
       def csv(str)
@@ -239,10 +237,25 @@ after_initialize do
       def apply_eligibility(scope)
         now = Time.zone.now
 
+        scope =
+          scope
+            .where("users.id > 0")
+            .where(users: { active: true, staged: false })
+            .where("users.trust_level >= ?", minimum_trust_level)
+            .where("users.suspended_till IS NULL OR users.suspended_till <= ?", now)
+            .where("users.silenced_till IS NULL OR users.silenced_till <= ?", now)
+            .where(
+              <<~SQL,
+                NOT EXISTS (
+                  SELECT 1
+                    FROM anonymous_users au
+                   WHERE au.user_id = users.id
+                )
+              SQL
+            )
+
+        scope = scope.where(users: { approved: true }) if SiteSetting.must_approve_users?
         scope
-          .where(users: { active: true, staged: false })
-          .where("users.trust_level >= ?", minimum_trust_level)
-          .where("users.suspended_till IS NULL OR users.suspended_till < ?", now)
       end
       private_class_method :apply_eligibility
 
